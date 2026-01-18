@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TypedDict, Literal
+import json
+from typing import TypedDict, Literal, Optional, Dict, Any
 
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI
@@ -19,7 +20,7 @@ def scheduling_service() -> str:
 
 @tool
 def service_insights_service(work_order_id: str) -> str:
-    """Get details + product_id from work_order_id."""
+    """Get work_order_type and product_id from work_order_id."""
     return f"work_order_type=Critical,product_id=PROD-77881 for {work_order_id}"
 
 
@@ -41,35 +42,75 @@ class AgentState(TypedDict, total=False):
     intent: Intent
 
     work_order_id: str
-    work_order_type: str
     product_id: str
+    work_order_type: str
 
     cleanup_steps: str
     final_answer: str
 
 
 # -----------------------------
-# Nodes
+# LLM Router Node
 # -----------------------------
 
-def router_node(state: AgentState) -> AgentState:
+def llm_router_node(state: AgentState) -> AgentState:
     """
-    In production, you can use an LLM classifier here.
-    For now, we do simple keyword routing for clarity.
+    Uses AzureChatOpenAI to classify the user question and extract IDs.
+    Returns:
+      intent: schedule_flow | insights_only | knowledge_only | unknown
+      work_order_id (optional)
+      product_id (optional)
     """
-    q = state["user_question"].lower()
+    model = AzureChatOpenAI(deployment_name="SMAX-AI-Dev-GPT4")
 
-    if "scheduled today" in q or "today" in q:
-        return {"intent": "schedule_flow"}
+    router_prompt = f"""
+You are a routing classifier for a ServiceMax agent workflow.
 
-    if "work order" in q and ("detail" in q or "details" in q or "insight" in q):
-        return {"intent": "insights_only"}
+Decide which workflow the system should run based on the user query.
 
-    if "clean" in q or "cleanup" in q or "documentation" in q:
-        return {"intent": "knowledge_only"}
+Valid intents:
+- schedule_flow: user asks what's scheduled today (and may also ask details/cleanup)
+- insights_only: user asks for details/insights about a specific work order
+- knowledge_only: user asks for cleanup steps/docs for a product
+- unknown: none of the above
 
-    return {"intent": "unknown"}
+Also extract:
+- work_order_id if present (example: WO1, WO-123)
+- product_id if present (example: PROD-77881)
 
+Return ONLY valid JSON with keys:
+intent, work_order_id, product_id
+
+User query:
+{state["user_question"]}
+""".strip()
+
+    resp = model.invoke(router_prompt)
+
+    # Parse JSON safely
+    try:
+        data = json.loads(resp.content)
+    except Exception:
+        data = {"intent": "unknown", "work_order_id": None, "product_id": None}
+
+    intent = data.get("intent", "unknown")
+    work_order_id = data.get("work_order_id")
+    product_id = data.get("product_id")
+
+    update: AgentState = {"intent": intent}
+
+    # only set these if extracted
+    if work_order_id:
+        update["work_order_id"] = work_order_id
+    if product_id:
+        update["product_id"] = product_id
+
+    return update
+
+
+# -----------------------------
+# Workflow Nodes
+# -----------------------------
 
 def scheduling_node(state: AgentState) -> AgentState:
     out = scheduling_service.invoke({})
@@ -78,8 +119,10 @@ def scheduling_node(state: AgentState) -> AgentState:
 
 
 def service_insights_node(state: AgentState) -> AgentState:
-    # if user provided WO directly, state may already have it
-    work_order_id = state.get("work_order_id", "WO-1")
+    work_order_id = state.get("work_order_id")
+    if not work_order_id:
+        # If router failed to extract and we didn’t run scheduling
+        return {"work_order_type": "Unknown", "product_id": ""}
 
     out = service_insights_service.invoke({"work_order_id": work_order_id})
     left = out.split(" for ")[0]
@@ -88,18 +131,12 @@ def service_insights_node(state: AgentState) -> AgentState:
     work_order_type = parts[0].split("=")[1].strip()
     product_id = parts[1].split("=")[1].strip()
 
-    return {
-        "work_order_type": work_order_type,
-        "product_id": product_id,
-        "work_order_id": work_order_id,
-    }
+    return {"work_order_type": work_order_type, "product_id": product_id}
 
 
 def knowledge_access_node(state: AgentState) -> AgentState:
-    # Requires product_id
     product_id = state.get("product_id")
     if not product_id:
-        # Graph-safe fallback: no product_id yet
         return {"cleanup_steps": "No product_id available to fetch cleanup steps."}
 
     out = knowledge_access_service.invoke({"product_id": product_id})
@@ -107,24 +144,22 @@ def knowledge_access_node(state: AgentState) -> AgentState:
 
 
 def final_answer_node(state: AgentState) -> AgentState:
-    """
-    LLM is optional here, but you can use AzureChatOpenAI
-    to format a clean answer.
-    """
     model = AzureChatOpenAI(deployment_name="SMAX-AI-Dev-GPT4")
 
     prompt = f"""
 You are a ServiceMax assistant.
-Only use the values below. Be concise.
+ONLY use the provided data and do not add assumptions.
 
-user_question: {state.get("user_question")}
+User question:
+{state.get("user_question")}
 
-work_order_id: {state.get("work_order_id")}
-work_order_type: {state.get("work_order_type")}
-product_id: {state.get("product_id")}
-cleanup_steps: {state.get("cleanup_steps")}
+Known data:
+- work_order_id: {state.get("work_order_id")}
+- work_order_type: {state.get("work_order_type")}
+- product_id: {state.get("product_id")}
+- cleanup_steps: {state.get("cleanup_steps")}
 
-Return the best possible final answer based only on available fields.
+Answer concisely.
 """.strip()
 
     resp = model.invoke(prompt)
@@ -132,7 +167,7 @@ Return the best possible final answer based only on available fields.
 
 
 # -----------------------------
-# Conditional routing function
+# Conditional Routing Function
 # -----------------------------
 
 def route_from_intent(state: AgentState) -> str:
@@ -146,7 +181,7 @@ def route_from_intent(state: AgentState) -> str:
 def build_graph():
     graph = StateGraph(AgentState)
 
-    graph.add_node("router", router_node)
+    graph.add_node("router", llm_router_node)
     graph.add_node("scheduling", scheduling_node)
     graph.add_node("service_insights", service_insights_node)
     graph.add_node("knowledge_access", knowledge_access_node)
@@ -154,7 +189,7 @@ def build_graph():
 
     graph.set_entry_point("router")
 
-    # ✅ conditional edges based on router decision
+    # ✅ LLM-based routing
     graph.add_conditional_edges(
         "router",
         route_from_intent,
@@ -166,15 +201,15 @@ def build_graph():
         },
     )
 
-    # schedule_flow path
+    # schedule flow: scheduling -> insights -> knowledge -> final
     graph.add_edge("scheduling", "service_insights")
     graph.add_edge("service_insights", "knowledge_access")
     graph.add_edge("knowledge_access", "final_answer")
 
-    # insights only path
+    # insights only: insights -> final
     graph.add_edge("service_insights", "final_answer")
 
-    # knowledge only path
+    # knowledge only: knowledge -> final
     graph.add_edge("knowledge_access", "final_answer")
 
     graph.add_edge("final_answer", END)
@@ -189,17 +224,18 @@ def build_graph():
 def main():
     app = build_graph()
 
-    # Example 1: user asks only WO details
-    q1 = "Provide the details of work order WO1"
-    r1 = app.invoke({"user_question": q1, "work_order_id": "WO1"})
-    print("\n--- Query 1 ---")
-    print(r1["final_answer"])
+    queries = [
+        "Provide details of work order WO1"
+        # "What work order is scheduled today and how to clean the machine?",
+        # "How do I clean product PROD-77881?",
+    ]
 
-    # Example 2: full workflow
-    q2 = "What work order is scheduled today and how to clean the machine?"
-    r2 = app.invoke({"user_question": q2})
-    print("\n--- Query 2 ---")
-    print(r2["final_answer"])
+    for q in queries:
+        result = app.invoke({"user_question": q})
+        print("\n==============================")
+        print("USER:", q)
+        print("------------------------------")
+        print(result["final_answer"])
 
 
 if __name__ == "__main__":
