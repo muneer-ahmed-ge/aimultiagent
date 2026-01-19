@@ -353,9 +353,9 @@ def main():
     app = build_orchestrator_graph()
 
     queries = [
-        "What work order is scheduled today? Tell me details and how to clean it.",
-        "Provide details of work order WO1",
-        "How do I clean product PROD-77881?",
+        "What work order is scheduled today? Tell me details and how to clean it."
+        # "Provide details of work order WO1",
+        # "How do I clean product PROD-77881?",
     ]
 
     for q in queries:
